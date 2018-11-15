@@ -80,6 +80,8 @@ from keras import models
 from keras import losses
 from keras import metrics
 from keras import backend
+from keras.backend import numpy_backend
+from keras import constraints
 from keras import activations
 from keras import preprocessing
 
@@ -91,6 +93,7 @@ if sys.version[0] == '2':
 
 EXCLUDE = {
     'Optimizer',
+    'TFOptimizer',
     'Wrapper',
     'get_session',
     'set_session',
@@ -99,8 +102,10 @@ EXCLUDE = {
     'deserialize',
     'get',
     'set_image_dim_ordering',
+    'normalize_data_format',
     'image_dim_ordering',
     'get_variable_shape',
+    'Constraint'
 }
 
 
@@ -114,7 +119,7 @@ EXCLUDE = {
 PAGES = [
     {
         'page': 'models/sequential.md',
-        'functions': [
+        'methods': [
             models.Sequential.compile,
             models.Sequential.fit,
             models.Sequential.evaluate,
@@ -130,7 +135,7 @@ PAGES = [
     },
     {
         'page': 'models/model.md',
-        'functions': [
+        'methods': [
             models.Model.compile,
             models.Model.fit,
             models.Model.evaluate,
@@ -172,6 +177,7 @@ PAGES = [
             layers.SeparableConv2D,
             layers.Conv2DTranspose,
             layers.Conv3D,
+            layers.Conv3DTranspose,
             layers.Cropping1D,
             layers.Cropping2D,
             layers.Cropping3D,
@@ -325,6 +331,10 @@ PAGES = [
         'all_module_functions': [backend],
     },
     {
+        'page': 'constraints.md',
+        'all_module_classes': [constraints],
+    },
+    {
         'page': 'utils.md',
         'functions': [utils.to_categorical,
                       utils.normalize,
@@ -339,32 +349,6 @@ PAGES = [
 ]
 
 ROOT = 'http://keras.io/'
-
-
-def get_earliest_class_that_defined_member(member, cls):
-    ancestors = get_classes_ancestors([cls])
-    result = None
-    for ancestor in ancestors:
-        if member in dir(ancestor):
-            result = ancestor
-    if not result:
-        return cls
-    return result
-
-
-def get_classes_ancestors(classes):
-    ancestors = []
-    for cls in classes:
-        ancestors += cls.__bases__
-    filtered_ancestors = []
-    for ancestor in ancestors:
-        if ancestor.__name__ in ['object']:
-            continue
-        filtered_ancestors.append(ancestor)
-    if filtered_ancestors:
-        return filtered_ancestors + get_classes_ancestors(filtered_ancestors)
-    else:
-        return filtered_ancestors
 
 
 def get_function_signature(function, method=True):
@@ -395,10 +379,6 @@ def get_function_signature(function, method=True):
         signature = st[:-2] + ')'
     else:
         signature = st + ')'
-
-    if not method:
-        # Prepend the module name.
-        signature = clean_module_name(function.__module__) + '.' + signature
     return post_process_signature(signature)
 
 
@@ -409,12 +389,15 @@ def get_class_signature(cls):
     except (TypeError, AttributeError):
         # in case the class inherits from object and does not
         # define __init__
-        class_signature = clean_module_name(cls.__module__) + '.' + cls.__name__ + '()'
+        class_signature = "{clean_module_name}.{cls_name}()".format(
+            clean_module_name=clean_module_name(cls.__module__),
+            cls_name=cls.__name__
+        )
     return post_process_signature(class_signature)
 
 
 def post_process_signature(signature):
-    parts = re.split('\.(?!\d)', signature)
+    parts = re.split(r'\.(?!\d)', signature)
     if len(parts) >= 4:
         if parts[1] == 'layers':
             signature = 'keras.layers.' + '.'.join(parts[3:])
@@ -459,18 +442,23 @@ def code_snippet(snippet):
 
 
 def count_leading_spaces(s):
-    ws = re.search('\S', s)
+    ws = re.search(r'\S', s)
     if ws:
         return ws.start()
     else:
         return 0
 
 
-def process_list_block(docstring, starting_point, leading_spaces, marker):
+def process_list_block(docstring, starting_point, section_end,
+                       leading_spaces, marker):
     ending_point = docstring.find('\n\n', starting_point)
-    block = docstring[starting_point:None if ending_point == -1 else ending_point - 1]
+    block = docstring[starting_point:(None if ending_point == -1 else
+                                      ending_point - 1)]
     # Place marker for later reinjection.
-    docstring = docstring.replace(block, marker)
+    docstring_slice = docstring[starting_point:section_end].replace(block, marker)
+    docstring = (docstring[:starting_point]
+                 + docstring_slice
+                 + docstring[section_end:])
     lines = block.split('\n')
     # Remove the computed number of leading white spaces from each line.
     lines = [re.sub('^' + ' ' * leading_spaces, '', line) for line in lines]
@@ -553,12 +541,20 @@ def process_docstring(docstring):
         anchor = section_idx.group(2)
         leading_spaces = len(section_idx.group(1))
         shift += section_idx.end()
+        next_section_idx = re.search(section_regex, docstring[shift:])
+        if next_section_idx is None:
+            section_end = -1
+        else:
+            section_end = shift + next_section_idx.start()
         marker = '$' + anchor.replace(' ', '_') + '$'
         docstring, content = process_list_block(docstring,
                                                 shift,
+                                                section_end,
                                                 leading_spaces,
                                                 marker)
         sections[marker] = content
+        # `docstring` has changed, so we can't use `next_section_idx` anymore
+        # we have to recompute it
         section_idx = re.search(section_regex, docstring[shift:])
 
     # Format docstring section titles.
@@ -580,6 +576,44 @@ def process_docstring(docstring):
             '$CODE_BLOCK_%d' % i, code_block)
     return docstring
 
+
+template_np_implementation = """# Numpy implementation
+
+    ```python
+{{code}}
+    ```
+"""
+
+template_hidden_np_implementation = """# Numpy implementation
+
+    <details>
+    <summary>Show the Numpy implementation</summary>
+
+    ```python
+{{code}}
+    ```
+
+    </details>
+"""
+
+
+def add_np_implementation(function, docstring):
+    np_implementation = getattr(numpy_backend, function.__name__)
+    code = inspect.getsource(np_implementation)
+    code_lines = code.split('\n')
+    for i in range(len(code_lines)):
+        if code_lines[i]:
+            # if there is something on the line, add 8 spaces.
+            code_lines[i] = '        ' + code_lines[i]
+    code = '\n'.join(code_lines[:-1])
+
+    if len(code_lines) < 10:
+        section = template_np_implementation.replace('{{code}}', code)
+    else:
+        section = template_hidden_np_implementation.replace('{{code}}', code)
+    return docstring.replace('{{np_implementation}}', section)
+
+
 print('Cleaning up existing sources directory.')
 if os.path.exists('sources'):
     shutil.rmtree('sources')
@@ -596,7 +630,6 @@ for subdir, dirs, fnames in os.walk('templates'):
             shutil.copy(fpath, new_fpath)
 
 
-# Take care of index page.
 def read_file(path):
     with open(path) as f:
         return f.read()
@@ -616,14 +649,38 @@ def collect_class_methods(cls, methods):
 def render_function(function, method=True):
     subblocks = []
     signature = get_function_signature(function, method=method)
-    signature = signature.replace(function.__module__ + '.', '')
-    level = 3
-    subblocks.append('#' * level + ' ' + function.__name__ + '\n')
+    if method:
+        signature = signature.replace(
+            clean_module_name(function.__module__) + '.', '')
+    subblocks.append('### ' + function.__name__ + '\n')
     subblocks.append(code_snippet(signature))
     docstring = function.__doc__
     if docstring:
+        if ('backend' in signature and
+                '{{np_implementation}}' in docstring):
+            docstring = add_np_implementation(function, docstring)
         subblocks.append(process_docstring(docstring))
     return '\n\n'.join(subblocks)
+
+
+def read_page_data(page_data, type):
+    assert type in ['classes', 'functions', 'methods']
+    data = page_data.get(type, [])
+    for module in page_data.get('all_module_{}'.format(type), []):
+        module_data = []
+        for name in dir(module):
+            if name[0] == '_' or name in EXCLUDE:
+                continue
+            module_member = getattr(module, name)
+            if (inspect.isclass(module_member) and type == 'classes' or
+               inspect.isfunction(module_member) and type == 'functions'):
+                instance = module_member
+                if module.__name__ in instance.__module__:
+                    if instance not in module_data:
+                        module_data.append(instance)
+        module_data.sort(key=lambda x: id(x))
+        data += module_data
+    return data
 
 
 if __name__ == '__main__':
@@ -635,22 +692,9 @@ if __name__ == '__main__':
 
     print('Generating docs for Keras %s.' % keras.__version__)
     for page_data in PAGES:
-        blocks = []
-        classes = page_data.get('classes', [])
-        for module in page_data.get('all_module_classes', []):
-            module_classes = []
-            for name in dir(module):
-                if name[0] == '_' or name in EXCLUDE:
-                    continue
-                module_member = getattr(module, name)
-                if inspect.isclass(module_member):
-                    cls = module_member
-                    if cls.__module__ == module.__name__:
-                        if cls not in module_classes:
-                            module_classes.append(cls)
-            module_classes.sort(key=lambda x: id(x))
-            classes += module_classes
+        classes = read_page_data(page_data, 'classes')
 
+        blocks = []
         for element in classes:
             if not isinstance(element, (list, tuple)):
                 element = (element, [])
@@ -675,20 +719,12 @@ if __name__ == '__main__':
                     [render_function(method, method=True) for method in methods]))
             blocks.append('\n'.join(subblocks))
 
-        functions = page_data.get('functions', [])
-        for module in page_data.get('all_module_functions', []):
-            module_functions = []
-            for name in dir(module):
-                if name[0] == '_' or name in EXCLUDE:
-                    continue
-                module_member = getattr(module, name)
-                if inspect.isfunction(module_member):
-                    function = module_member
-                    if module.__name__ in function.__module__:
-                        if function not in module_functions:
-                            module_functions.append(function)
-            module_functions.sort(key=lambda x: id(x))
-            functions += module_functions
+        methods = read_page_data(page_data, 'methods')
+
+        for method in methods:
+            blocks.append(render_function(method, method=True))
+
+        functions = read_page_data(page_data, 'functions')
 
         for function in functions:
             blocks.append(render_function(function, method=False))
@@ -706,7 +742,8 @@ if __name__ == '__main__':
         if os.path.exists(path):
             template = read_file(path)
             assert '{{autogenerated}}' in template, ('Template found for ' + path +
-                                                     ' but missing {{autogenerated}} tag.')
+                                                     ' but missing {{autogenerated}}'
+                                                     ' tag.')
             mkdown = template.replace('{{autogenerated}}', mkdown)
             print('...inserting autogenerated content into template:', path)
         else:
